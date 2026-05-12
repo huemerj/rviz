@@ -139,6 +139,8 @@ protected:
 private Q_SLOTS:
   void updateAlpha();
 
+  void updateCameraInfoTopic();
+
 private:
   void subscribe() override;
 
@@ -195,6 +197,7 @@ private:
 
   std::shared_ptr<message_filters::Cache<sensor_msgs::msg::Image>> cache_images_;
 
+  rviz_common::properties::RosTopicProperty * camera_info_topic_property_;
   rviz_common::properties::FloatProperty * alpha_property_;
   rviz_common::properties::EnumProperty * image_position_property_;
   rviz_common::properties::FloatProperty * zoom_property_;
@@ -207,6 +210,7 @@ private:
   bool new_caminfo_;
   bool caminfo_ok_;
   bool force_render_;
+  bool camera_info_topic_auto_filled_;
 
   uint32_t vis_bit_;
 
