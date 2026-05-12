@@ -100,8 +100,17 @@ CameraDisplay::CameraDisplay()
   texture_(std::make_unique<ROSImageTexture>()),
   new_caminfo_(false),
   caminfo_ok_(false),
-  force_render_(false)
+  force_render_(false),
+  camera_info_topic_auto_filled_(false)
 {
+
+  camera_info_topic_property_ = new rviz_common::properties::RosTopicProperty(
+    "Camera Info Topic", "",
+    "sensor_msgs/msg/CameraInfo",
+    "The topic to subscribe to for camera info messages. "
+    "If empty, the topic is automatically derived from the image topic.",
+    this, SLOT(updateCameraInfoTopic()));
+
   image_position_property_ = new rviz_common::properties::EnumProperty(
     "Image Rendering", BOTH,
     "Render the image behind all other geometry or overlay it on top, or both.",
@@ -130,6 +139,7 @@ CameraDisplay::CameraDisplay()
     this);
   far_plane_property_->setMin(0.00001f);
   far_plane_property_->setMax(100000.0f);
+
 }
 
 CameraDisplay::~CameraDisplay()
@@ -144,6 +154,8 @@ CameraDisplay::~CameraDisplay()
 void CameraDisplay::onInitialize()
 {
   ITDClass::onInitialize();
+
+  camera_info_topic_property_->initialize(rviz_ros_node_);
 
   setupSceneNodes();
   setupRenderPanel();
@@ -285,9 +297,21 @@ void CameraDisplay::fixedFrameChanged()
 
 void CameraDisplay::subscribe()
 {
-  ITDClass::subscribe();
+  if (camera_info_topic_auto_filled_) {
+    camera_info_topic_property_->blockSignals(true);
+    camera_info_topic_property_->setString("");
+    camera_info_topic_property_->blockSignals(false);
+    camera_info_topic_auto_filled_ = false;
+  }
 
-  if (!subscription_) {
+  try {
+    ITDClass::subscribe();
+  } catch (std::exception & e) {
+    setStatus(StatusLevel::Error, "Topic", QString("Error subscribing: ") + e.what());
+    return;
+  }
+
+  if (!subscription_ || subscription_->getSubscriber().getTopic().empty()) {
     return;
   }
 
@@ -314,20 +338,53 @@ void CameraDisplay::subscribe()
   createCameraInfoSubscription();
 }
 
+void CameraDisplay::updateCameraInfoTopic()
+{
+  camera_info_topic_auto_filled_ = false;
+
+  if (initialized() && isEnabled()) {
+    // Reset the cached camera info so the new topic's data is used.
+    {
+      std::unique_lock<std::mutex> lock(caminfo_mutex_);
+      current_caminfo_.reset();
+      new_caminfo_ = false;
+    }
+    caminfo_ok_ = false;
+    caminfo_sub_.reset();
+    createCameraInfoSubscription();
+    context_->queueRender();
+  }
+}
+
 void CameraDisplay::createCameraInfoSubscription()
 {
   try {
     // TODO(anhosi,wjwwood): replace with abstraction for subscriptions one available
 
-    // The camera_info topic should be at the same level as the image topic
-    // TODO(anyone) Store this in a member variable
-
-    std::string camera_info_topic = image_transport::getCameraInfoTopic(
-      getBaseTopicFromTopic(topic_property_->getTopicStd()));
+    // If the camera info topic property is empty, derive it from the image topic
+    // and fill in the property so the user can see which topic is being used.
+    std::string camera_info_topic;
+    if (camera_info_topic_property_->getTopicStd().empty()) {
+      camera_info_topic = image_transport::getCameraInfoTopic(
+        getBaseTopicFromTopic(topic_property_->getTopicStd()));
+      if (camera_info_topic.empty()) {
+        setStatus(
+          StatusLevel::Warn, CAM_INFO_STATUS,
+          "Could not derive Camera Info topic from image topic.");
+        return;
+      }
+      camera_info_topic_property_->blockSignals(true);
+      camera_info_topic_property_->setString(QString::fromStdString(camera_info_topic));
+      camera_info_topic_property_->blockSignals(false);
+      camera_info_topic_auto_filled_ = true;
+    } else {
+      camera_info_topic = camera_info_topic_property_->getTopicStd();
+      camera_info_topic_auto_filled_ = false;
+    }
 
     rclcpp::SubscriptionOptions sub_opts;
     sub_opts.event_callbacks.message_lost_callback =
-      [&](rclcpp::QOSMessageLostInfo & info)
+      [this](rclcpp::QOSMessageLostInfo & info)
       {
         std::ostringstream sstm;
         sstm << "Some messages were lost:\n>\tNumber of new lost messages: " <<
@@ -348,6 +405,10 @@ void CameraDisplay::createCameraInfoSubscription()
 
     setStatus(StatusLevel::Ok, CAM_INFO_STATUS, "OK");
   } catch (rclcpp::exceptions::InvalidTopicNameError & e) {
+    setStatus(StatusLevel::Error, CAM_INFO_STATUS, QString("Error subscribing: ") + e.what());
+  } catch (std::system_error & e) {
+    setStatus(StatusLevel::Error, CAM_INFO_STATUS, QString("Error subscribing: ") + e.what());
+  } catch (std::exception & e) {
     setStatus(StatusLevel::Error, CAM_INFO_STATUS, QString("Error subscribing: ") + e.what());
   }
 }
@@ -431,8 +492,13 @@ bool CameraDisplay::updateCamera()
   }
 
   if (!info) {
-    std::string camera_info_topic = image_transport::getCameraInfoTopic(
-      getBaseTopicFromTopic(topic_property_->getTopicStd()));
+    std::string camera_info_topic;
+    if (camera_info_topic_property_->getStdString().empty()) {
+      camera_info_topic = image_transport::getCameraInfoTopic(
+        getBaseTopicFromTopic(topic_property_->getTopicStd()));
+    } else {
+      camera_info_topic = camera_info_topic_property_->getStdString();
+    }
 
     setStatus(
       StatusLevel::Warn, CAM_INFO_STATUS,
