@@ -34,6 +34,7 @@
 #include <memory>
 #include <string>
 #include <sstream>
+#include <algorithm>
 
 #include <OgreManualObject.h>
 #include <OgreMaterialManager.h>
@@ -48,6 +49,7 @@
 #include <OgreCamera.h>
 
 #include "image_transport/camera_common.hpp"
+#include "image_transport/image_transport.hpp"
 
 #include "rviz_rendering/material_manager.hpp"
 #include "rviz_rendering/objects/axes.hpp"
@@ -60,6 +62,8 @@
 #include "rviz_common/properties/enum_property.hpp"
 #include "rviz_common/properties/float_property.hpp"
 #include "rviz_common/properties/int_property.hpp"
+#include "rviz_common/properties/bool_property.hpp"
+#include "rviz_common/properties/string_property.hpp"
 #include "rviz_common/properties/ros_topic_property.hpp"
 #include "rviz_common/render_panel.hpp"
 #include "rviz_common/uniform_string_stream.hpp"
@@ -162,6 +166,39 @@ CameraDisplay::CameraDisplay()
   far_plane_property_->setMin(0.00001f);
   far_plane_property_->setMax(100000.0f);
 
+  publish_image_property_ = new rviz_common::properties::BoolProperty(
+    "Publish Rendered Image", false,
+    "Publish the rendered camera view (with overlays) as a ROS image topic.",
+    this, SLOT(updatePublishImage()));
+
+  publish_topic_property_ = new rviz_common::properties::RosTopicProperty(
+    "Publish Topic", "/camera_display/image_raw",
+    "sensor_msgs/msg/Image",
+    "Topic on which the rendered camera image is published.",
+    this, SLOT(updatePublishImage()));
+  publish_topic_property_->setHidden(true);
+
+  publish_use_input_res_property_ = new rviz_common::properties::BoolProperty(
+    "Use Input Resolution", true,
+    "Automatically use the input image resolution for the published image. "
+    "Disable to set a custom width and height.",
+    this, SLOT(updatePublishUseInputRes()));
+  publish_use_input_res_property_->setHidden(true);
+
+  publish_width_property_ = new rviz_common::properties::IntProperty(
+    "Publish Width", 640,
+    "Width in pixels of the published image. Resizes the camera view panel.",
+    this, SLOT(updatePublishSize()));
+  publish_width_property_->setMin(1);
+  publish_width_property_->setHidden(true);
+
+  publish_height_property_ = new rviz_common::properties::IntProperty(
+    "Publish Height", 480,
+    "Height in pixels of the published image. Resizes the camera view panel.",
+    this, SLOT(updatePublishSize()));
+  publish_height_property_->setMin(1);
+  publish_height_property_->setHidden(true);
+
 }
 
 CameraDisplay::~CameraDisplay()
@@ -178,6 +215,7 @@ void CameraDisplay::onInitialize()
   ITDClass::onInitialize();
 
   camera_info_topic_property_->initialize(rviz_ros_node_);
+  publish_topic_property_->initialize(rviz_ros_node_);
 
   setupSceneNodes();
   setupRenderPanel();
@@ -291,6 +329,42 @@ void CameraDisplay::preRenderTargetUpdate(const Ogre::RenderTargetEvent & evt)
 void CameraDisplay::postRenderTargetUpdate(const Ogre::RenderTargetEvent & evt)
 {
   (void) evt;
+
+  if (image_pub_ && caminfo_ok_) {
+    auto render_window = render_panel_->getRenderWindow();
+    auto * viewport = rviz_rendering::RenderWindowOgreAdapter::getOgreViewport(render_window);
+    if (viewport) {
+      auto * render_target = viewport->getTarget();
+      const uint32_t rt_width = render_target->getWidth();
+      const uint32_t rt_height = render_target->getHeight();
+      if (rt_width > 0 && rt_height > 0) {
+        // Crop to the image region, excluding letterbox/pillarbox padding.
+        // zoom components > 1 mean the image overflows the viewport (no padding).
+        float zx = std::min(last_zoom_.x, 1.0f);
+        float zy = std::min(last_zoom_.y, 1.0f);
+        uint32_t x1 = static_cast<uint32_t>((1.0f - zx) * 0.5f * rt_width);
+        uint32_t y1 = static_cast<uint32_t>((1.0f - zy) * 0.5f * rt_height);
+        uint32_t x2 = rt_width - x1;
+        uint32_t y2 = rt_height - y1;
+        uint32_t img_width = x2 - x1;
+        uint32_t img_height = y2 - y1;
+        sensor_msgs::msg::Image msg;
+        msg.width = img_width;
+        msg.height = img_height;
+        msg.encoding = "rgb8";
+        msg.step = img_width * 3;
+        msg.data.resize(img_width * img_height * 3);
+        Ogre::PixelBox pixel_box(img_width, img_height, 1, Ogre::PF_BYTE_RGB, msg.data.data());
+        render_target->copyContentsToMemory(
+          Ogre::Box(x1, y1, x2, y2), pixel_box, Ogre::RenderTarget::FB_AUTO);
+        if (texture_->getImage()) {
+          msg.header = texture_->getImage()->header;
+        }
+        image_pub_->publish(msg);
+      }
+    }
+  }
+
   background_scene_node_->setVisible(false);
   overlay_scene_node_->setVisible(false);
 }
@@ -376,6 +450,45 @@ void CameraDisplay::updateCameraInfoTopic()
     caminfo_sub_.reset();
     createCameraInfoSubscription();
     context_->queueRender();
+  }
+}
+
+void CameraDisplay::updatePublishImage()
+{
+  bool enabled = publish_image_property_->getBool();
+  publish_topic_property_->setHidden(!enabled);
+  publish_use_input_res_property_->setHidden(!enabled);
+  image_pub_.reset();
+  if (enabled) {
+    updatePublishUseInputRes();
+    if (!publish_topic_property_->getTopicStd().empty()) {
+      auto node = rviz_ros_node_.lock()->get_raw_node();
+      image_pub_ = std::make_shared<image_transport::Publisher>(
+        image_transport::create_publisher(
+          node.get(), publish_topic_property_->getTopicStd(), rclcpp::QoS(1).get_rmw_qos_profile()));
+    }
+  } else {
+    publish_width_property_->setHidden(true);
+    publish_height_property_->setHidden(true);
+  }
+}
+
+void CameraDisplay::updatePublishUseInputRes()
+{
+  bool use_input = publish_use_input_res_property_->getBool();
+  publish_width_property_->setHidden(use_input);
+  publish_height_property_->setHidden(use_input);
+  if (!use_input) {
+    updatePublishSize();
+  }
+}
+
+void CameraDisplay::updatePublishSize()
+{
+  if (publish_image_property_->getBool()) {
+    render_panel_->resize(
+      publish_width_property_->getInt(),
+      publish_height_property_->getInt());
   }
 }
 
@@ -618,6 +731,8 @@ bool CameraDisplay::updateCamera()
   setStatus(StatusLevel::Ok, TIME_STATUS, "ok");
   setStatus(StatusLevel::Ok, CAM_INFO_STATUS, "ok");
 
+  last_zoom_ = zoom;
+
   return true;
 }
 
@@ -730,6 +845,21 @@ Ogre::Matrix4 CameraDisplay::calculateProjectionMatrix(
 void CameraDisplay::processMessage(sensor_msgs::msg::Image::ConstSharedPtr msg)
 {
   texture_->addMessage(msg);
+  if (publish_image_property_->getBool() && publish_use_input_res_property_->getBool()) {
+    int w = static_cast<int>(msg->width);
+    int h = static_cast<int>(msg->height);
+    if (w > 0 && h > 0 &&
+      (w != publish_width_property_->getInt() || h != publish_height_property_->getInt()))
+    {
+      publish_width_property_->blockSignals(true);
+      publish_height_property_->blockSignals(true);
+      publish_width_property_->setInt(w);
+      publish_height_property_->setInt(h);
+      publish_width_property_->blockSignals(false);
+      publish_height_property_->blockSignals(false);
+      render_panel_->resize(w, h);
+    }
+  }
 }
 
 void CameraDisplay::reset()

@@ -48,8 +48,11 @@
 
 #include <message_filters/cache.h>
 
+# include "rclcpp/rclcpp.hpp"
 # include "sensor_msgs/msg/camera_info.hpp"
+# include "sensor_msgs/msg/image.hpp"
 # include "tf2_ros/message_filter.h"
+# include "image_transport/image_transport.hpp"
 
 # include "rviz_default_plugins/displays/image/image_transport_display.hpp"
 # include "rviz_default_plugins/displays/image/ros_image_texture_iface.hpp"
@@ -78,6 +81,7 @@ namespace properties
 class EnumProperty;
 class FloatProperty;
 class IntProperty;
+class BoolProperty;
 class RosTopicProperty;
 class DisplayGroupVisibilityProperty;
 }  // namespace properties
@@ -141,6 +145,12 @@ private Q_SLOTS:
 
   void updateCameraInfoTopic();
 
+  void updatePublishImage();
+
+  void updatePublishUseInputRes();
+
+  void updatePublishSize();
+
 private:
   void subscribe() override;
 
@@ -203,6 +213,13 @@ private:
   rviz_common::properties::FloatProperty * zoom_property_;
   rviz_common::properties::FloatProperty * far_plane_property_;
   rviz_common::properties::DisplayGroupVisibilityProperty * visibility_property_;
+  rviz_common::properties::BoolProperty * publish_image_property_;
+  rviz_common::properties::RosTopicProperty * publish_topic_property_;
+  rviz_common::properties::BoolProperty * publish_use_input_res_property_;
+  rviz_common::properties::IntProperty * publish_width_property_;
+  rviz_common::properties::IntProperty * publish_height_property_;
+
+  std::shared_ptr<image_transport::Publisher> image_pub_;
 
   sensor_msgs::msg::CameraInfo::ConstSharedPtr current_caminfo_;
   std::mutex caminfo_mutex_;
@@ -211,6 +228,8 @@ private:
   bool caminfo_ok_;
   bool force_render_;
   bool camera_info_topic_auto_filled_;
+
+  Ogre::Vector2 last_zoom_{1.0f, 1.0f};
 
   uint32_t vis_bit_;
 
